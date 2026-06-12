@@ -193,7 +193,7 @@ end
 
 function requireCallId(value)
     value isa Integer && !(value isa Bool) || throw(IpcError("callId must be an integer"))
-    value > 0 || throw(IpcError("callId must be positive"))
+    0 < value <= typemax(Int) || throw(IpcError("callId must be a positive integer"))
     return Int(value)
 end
 
@@ -420,7 +420,7 @@ end
 function requirePositiveInt(message, key::String)
     haskey(message, key) || throw(IpcError("missing required field $(repr(key))"))
     value = message[key]
-    value isa Integer && !(value isa Bool) && value > 0 ||
+    value isa Integer && !(value isa Bool) && 0 < value <= typemax(Int) ||
         throw(IpcError("$(key) must be a positive integer"))
     return Int(value)
 end
@@ -430,6 +430,90 @@ function requireBool(message, key::String)
     value = message[key]
     value isa Bool || throw(IpcError("$(key) must be a boolean"))
     return value
+end
+
+# --- inbound boundary ---------------------------------------------------------
+# parseWorkerMessage is total over peer bytes: every datagram becomes exactly one
+# typed message or Malformed — it never throws on input. Handlers downstream only
+# ever see well-formed messages, so bytes off the wire cannot kill the dispatch
+# loop, and any exception raised past this point is a deliberate protocol-state
+# rejection or an internal bug.
+
+struct WorkerHello
+    workerId::String
+end
+
+struct WorkerGoodbye
+    workerId::String
+end
+
+struct Assign
+    runKey::String
+    workerId::String
+end
+
+struct Release
+    runKey::String
+end
+
+# executorResult | executorError: the payload is forwarded raw to the pending
+# call's channel; output decoding stays in the executor task, where a bad reply
+# fails one call instead of the gateway.
+struct ExecutorReply
+    callId::Int
+    payload::Vector{UInt8}
+end
+
+struct LoadNet
+    name::String
+    net::Peven.Net
+end
+
+struct Fire
+    fireId::String
+    net::String
+    marking::Peven.Marking
+    fuse::Int
+    maxConcurrency::Int
+end
+
+struct Malformed
+    reason::String
+end
+
+function parseWorkerMessage(payload::AbstractVector{UInt8})
+    try
+        message = requireMap(decode(payload), "message")
+        kind = requireString(message, "kind")
+        if kind == "executorResult" || kind == "executorError"
+            return ExecutorReply(callId(message), Vector{UInt8}(payload))
+        elseif kind == "workerHello"
+            return WorkerHello(decodeWorkerHello(message))
+        elseif kind == "workerGoodbye"
+            return WorkerGoodbye(decodeWorkerGoodbye(message))
+        elseif kind == "assign"
+            assignment = decodeAssign(message)
+            return Assign(assignment.runKey, assignment.workerId)
+        elseif kind == "release"
+            return Release(decodeRelease(message))
+        elseif kind == "loadNet"
+            loaded = decodeLoadNet(message)
+            return LoadNet(loaded.name, loaded.net)
+        elseif kind == "fire"
+            request = decodeFire(message)
+            return Fire(
+                request.fireId,
+                request.net,
+                request.marking,
+                request.fuse,
+                request.maxConcurrency,
+            )
+        end
+        throw(IpcError("unsupported worker message kind $(repr(kind))"))
+    catch error
+        error isa InterruptException && rethrow()
+        return Malformed(sprint(showerror, error))
+    end
 end
 
 end # module IPC

@@ -127,6 +127,58 @@ end
     end
 end
 
+@testset "ZMQ survives malformed datagrams" begin
+    endpoint = "inproc://peventransport-malformed-$(time_ns())"
+    router = PevenTransport.Router.RouterState()
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+    worker = dealer(endpoint)
+    runTask = Threads.@spawn PevenTransport.Zmq.run!(gateway, router)
+
+    try
+        # wrong frame count: a DEALER sending two body frames reaches the
+        # ROUTER as three frames, like a REQ socket's empty delimiter would
+        ZMQ.send_multipart(worker, [Vector{UInt8}("x"), Vector{UInt8}("y")])
+        @test recvMessage(worker)["kind"] == "gatewayError"
+        @test !istaskdone(runTask)
+
+        # bytes that are not msgpack (0xc1 is reserved and never valid)
+        Sockets.send(worker, UInt8[0xc1])
+        @test recvMessage(worker)["kind"] == "gatewayError"
+        @test !istaskdone(runTask)
+
+        # well-formed msgpack whose top level is not a map
+        Sockets.send(worker, PevenTransport.IPC.encode(42))
+        reply = recvMessage(worker)
+        @test reply["kind"] == "gatewayError"
+        @test reply["error"] == "message must be a map"
+        @test !istaskdone(runTask)
+
+        # integer field that overflows Int
+        Sockets.send(
+            worker,
+            PevenTransport.IPC.encode(
+                Dict(
+                    "kind" => "executorResult",
+                    "callId" => typemax(UInt64),
+                    "outputs" => Dict(),
+                ),
+            ),
+        )
+        reply = recvMessage(worker)
+        @test reply["kind"] == "gatewayError"
+        @test reply["error"] == "callId must be a positive integer"
+        @test !istaskdone(runTask)
+
+        # the loop is still serving well-formed peers
+        sendWorkerHello(worker, "workerA")
+        @test recvMessage(worker) == PevenTransport.IPC.workerReady("workerA")
+    finally
+        close(worker)
+        PevenTransport.Zmq.stop!(gateway)
+        fetch(runTask)
+    end
+end
+
 @testset "ZMQ rejects unsupported worker messages" begin
     endpoint = "inproc://peventransport-unsupported-message-$(time_ns())"
     router = PevenTransport.Router.RouterState()
@@ -354,13 +406,14 @@ end
         identity = UInt8[0x01]
         channel = PevenTransport.Zmq.registerCall!(gateway, 7, identity)
         payload = encodeExecutorResult(7)
-        PevenTransport.Zmq.completeCall!(gateway, identity, payload)
+        PevenTransport.Zmq.completeCall!(gateway, identity, 7, payload)
 
         @test take!(channel) == payload
         @test isempty(gateway.pendingCalls)
         @test_throws PevenTransport.Zmq.ZmqError PevenTransport.Zmq.completeCall!(
             gateway,
             identity,
+            7,
             payload,
         )
 
@@ -369,19 +422,15 @@ end
         @test_throws PevenTransport.Zmq.ZmqError PevenTransport.Zmq.completeCall!(
             gateway,
             UInt8[0x02],
+            8,
             wrongPayload,
         )
         @test haskey(gateway.pendingCalls, 8)
-        PevenTransport.Zmq.completeCall!(gateway, identity, wrongPayload)
+        PevenTransport.Zmq.completeCall!(gateway, identity, 8, wrongPayload)
         @test take!(channel) == wrongPayload
 
         PevenTransport.Zmq.registerCall!(gateway, 9, identity)
         @test_throws PevenTransport.Zmq.ZmqError PevenTransport.Zmq.registerCall!(gateway, 9, identity)
-        @test_throws PevenTransport.IPC.IpcError PevenTransport.Zmq.completeCall!(
-            gateway,
-            identity,
-            PevenTransport.IPC.encode(Dict("kind" => "executorResult", "outputs" => Dict())),
-        )
     finally
         close(gateway.socket)
     end
@@ -432,6 +481,7 @@ end
         PevenTransport.Zmq.completeCall!(
             gateway,
             identityB,
+            2,
             PevenTransport.IPC.encode(
                 executorResult(2),
             ),

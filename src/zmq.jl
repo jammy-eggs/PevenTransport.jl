@@ -124,106 +124,157 @@ function stop!(gateway::Gateway)
 end
 
 function dispatch!(gateway::Gateway, routerState::Router.RouterState)
-    identity, payload = withSocketLock(gateway) do
-        receiveWorker(gateway)
+    frames = withSocketLock(gateway) do
+        ZMQ.recv_multipart(gateway.socket, Vector{UInt8})
     end
+    identity = frames[1]
+    if length(frames) != 2
+        replyGatewayError!(
+            gateway, identity, "expected ROUTER message with identity and payload"
+        )
+        return nothing
+    end
+    payload = frames[2]
     isempty(payload) && return disconnectWorker!(gateway, routerState, identity)
+    message = IPC.parseWorkerMessage(payload)
+    if message isa IPC.Malformed
+        replyGatewayError!(gateway, identity, message.reason)
+        return nothing
+    end
     try
-        dispatchWorker!(gateway, routerState, identity, payload)
+        handle!(gateway, routerState, identity, message)
     catch error
+        # parseWorkerMessage already absorbed everything bytes can cause, so
+        # this whitelist is exact: protocol-state rejections reply, internal
+        # bugs crash loudly.
         if error isa ZmqError || error isa IPC.IpcError || error isa Router.RouterError
-            reply = IPC.gatewayError(sprint(showerror, error)) |> IPC.encode
-            withSocketLock(gateway) do
-                sendWorker!(gateway, identity, reply)
-            end
+            replyGatewayError!(gateway, identity, sprint(showerror, error))
             return nothing
         end
         rethrow(error)
     end
+    return nothing
 end
 
-function dispatchWorker!(
+# Best-effort: a failed error reply must not take down the dispatch loop.
+function replyGatewayError!(gateway::Gateway, identity::Vector{UInt8}, message::String)
+    reply = IPC.gatewayError(message) |> IPC.encode
+    try
+        withSocketLock(gateway) do
+            sendWorker!(gateway, identity, reply)
+        end
+    catch error
+        error isa InterruptException && rethrow()
+    end
+    return nothing
+end
+
+function handle!(
     gateway::Gateway,
     routerState::Router.RouterState,
     identity::Vector{UInt8},
-    payload::Vector{UInt8},
+    message::IPC.ExecutorReply,
 )
-    message = IPC.decode(payload)
-    kind = get(message, "kind", nothing)
-    if kind == "executorResult" || kind == "executorError"
-        completeCall!(gateway, identity, payload)
-        return nothing
+    completeCall!(gateway, identity, message.callId, message.payload)
+    return nothing
+end
+
+function handle!(
+    gateway::Gateway,
+    routerState::Router.RouterState,
+    identity::Vector{UInt8},
+    message::IPC.WorkerHello,
+)
+    recordIdentity!(gateway, message.workerId, identity)
+    Router.registerWorker!(routerState, message.workerId)
+    reply = IPC.workerReady(message.workerId) |> IPC.encode
+    withSocketLock(gateway) do
+        sendWorker!(gateway, identity, reply)
     end
-    if kind == "workerHello"
-        workerId = IPC.decodeWorkerHello(message)
-        recordIdentity!(gateway, workerId, identity)
-        Router.registerWorker!(routerState, workerId)
-        reply = IPC.workerReady(workerId) |> IPC.encode
-        withSocketLock(gateway) do
-            sendWorker!(gateway, identity, reply)
-        end
-        return nothing
+    return nothing
+end
+
+function handle!(
+    gateway::Gateway,
+    routerState::Router.RouterState,
+    identity::Vector{UInt8},
+    message::IPC.WorkerGoodbye,
+)
+    expected = workerIdentity(gateway, message.workerId)
+    expected == identity ||
+        throw(ZmqError("workerGoodbye came from unexpected identity"))
+    forgetWorker!(gateway, routerState, message.workerId)
+    reply = IPC.workerGone(message.workerId) |> IPC.encode
+    withSocketLock(gateway) do
+        sendWorker!(gateway, identity, reply)
     end
-    if kind == "workerGoodbye"
-        workerId = IPC.decodeWorkerGoodbye(message)
-        expected = workerIdentity(gateway, workerId)
-        expected == identity ||
-            throw(ZmqError("workerGoodbye came from unexpected identity"))
-        forgetWorker!(gateway, routerState, workerId)
-        reply = IPC.workerGone(workerId) |> IPC.encode
-        withSocketLock(gateway) do
-            sendWorker!(gateway, identity, reply)
-        end
-        return nothing
+    return nothing
+end
+
+function handle!(
+    gateway::Gateway,
+    routerState::Router.RouterState,
+    identity::Vector{UInt8},
+    message::IPC.Assign,
+)
+    expected = workerIdentity(gateway, message.workerId)
+    expected == identity || throw(ZmqError("assign came from unexpected identity"))
+    Router.route!(routerState, message.runKey, message.workerId)
+    reply = IPC.assigned(message.runKey, message.workerId) |> IPC.encode
+    withSocketLock(gateway) do
+        sendWorker!(gateway, identity, reply)
     end
-    if kind == "assign"
-        assignment = IPC.decodeAssign(message)
-        expected = workerIdentity(gateway, assignment.workerId)
-        expected == identity ||
-            throw(ZmqError("assign came from unexpected identity"))
-        Router.route!(routerState, assignment.runKey, assignment.workerId)
-        reply = IPC.assigned(assignment.runKey, assignment.workerId) |> IPC.encode
-        withSocketLock(gateway) do
-            sendWorker!(gateway, identity, reply)
-        end
-        return nothing
+    return nothing
+end
+
+function handle!(
+    gateway::Gateway,
+    routerState::Router.RouterState,
+    identity::Vector{UInt8},
+    message::IPC.Release,
+)
+    workerId = Router.workerForRun(routerState, message.runKey)
+    expected = workerIdentity(gateway, workerId)
+    expected == identity || throw(ZmqError("release came from unexpected identity"))
+    Router.unroute!(routerState, message.runKey)
+    reply = IPC.released(message.runKey) |> IPC.encode
+    withSocketLock(gateway) do
+        sendWorker!(gateway, identity, reply)
     end
-    if kind == "release"
-        runKey = IPC.decodeRelease(message)
-        workerId = Router.workerForRun(routerState, runKey)
-        expected = workerIdentity(gateway, workerId)
-        expected == identity ||
-            throw(ZmqError("release came from unexpected identity"))
-        Router.unroute!(routerState, runKey)
-        reply = IPC.released(runKey) |> IPC.encode
-        withSocketLock(gateway) do
-            sendWorker!(gateway, identity, reply)
-        end
-        return nothing
+    return nothing
+end
+
+function handle!(
+    gateway::Gateway,
+    routerState::Router.RouterState,
+    identity::Vector{UInt8},
+    message::IPC.LoadNet,
+)
+    # registerNet! writes the engine's unlocked executor registry, which
+    # active fires read concurrently — reject instead of racing.
+    lock(gateway.controlLock) do
+        isempty(gateway.activeFires) ||
+            throw(ZmqError("cannot load a net while fires are active"))
     end
-    if kind == "loadNet"
-        # registerNet! writes the engine's unlocked executor registry, which
-        # active fires read concurrently — reject instead of racing.
-        lock(gateway.controlLock) do
-            isempty(gateway.activeFires) ||
-                throw(ZmqError("cannot load a net while fires are active"))
-        end
-        loaded = IPC.decodeLoadNet(message)
-        issues = Peven.validate!(Peven.ValidationIssue[], loaded.net)
-        isempty(issues) ||
-            throw(ZmqError("invalid net $(repr(loaded.name)): $(issues[1].message)"))
-        registerNet!(gateway, routerState, loaded.name, loaded.net)
-        reply = IPC.netLoaded(loaded.name) |> IPC.encode
-        withSocketLock(gateway) do
-            sendWorker!(gateway, identity, reply)
-        end
-        return nothing
+    issues = Peven.validate!(Peven.ValidationIssue[], message.net)
+    isempty(issues) ||
+        throw(ZmqError("invalid net $(repr(message.name)): $(issues[1].message)"))
+    registerNet!(gateway, routerState, message.name, message.net)
+    reply = IPC.netLoaded(message.name) |> IPC.encode
+    withSocketLock(gateway) do
+        sendWorker!(gateway, identity, reply)
     end
-    if kind == "fire"
-        fire!(gateway, routerState, identity, IPC.decodeFire(message))
-        return nothing
-    end
-    throw(ZmqError("unsupported worker message kind $(repr(kind))"))
+    return nothing
+end
+
+function handle!(
+    gateway::Gateway,
+    routerState::Router.RouterState,
+    identity::Vector{UInt8},
+    message::IPC.Fire,
+)
+    fire!(gateway, routerState, identity, message)
+    return nothing
 end
 
 function registerNet!(
@@ -322,13 +373,6 @@ end
 function sendControl!(gateway::Gateway, identity::Vector{UInt8}, message)
     put!(gateway.outboundSends, OutboundSend(identity, IPC.encode(message)))
     return nothing
-end
-
-function receiveWorker(gateway::Gateway)
-    frames = ZMQ.recv_multipart(gateway.socket, Vector{UInt8})
-    length(frames) == 2 ||
-        throw(ZmqError("expected ROUTER message with identity and payload"))
-    return frames[1], frames[2]
 end
 
 function Router.callWorker(gateway::Gateway, workerId::String, payload::Vector{UInt8})
@@ -538,8 +582,12 @@ function failPendingCalls!(gateway::Gateway, identity::Vector{UInt8}, message::S
     return nothing
 end
 
-function completeCall!(gateway::Gateway, identity::Vector{UInt8}, payload::Vector{UInt8})
-    callId = IPC.callId(IPC.decode(payload))
+function completeCall!(
+    gateway::Gateway,
+    identity::Vector{UInt8},
+    callId::Int,
+    payload::Vector{UInt8},
+)
     pending = lock(gateway.callLock) do
         pending = get(gateway.pendingCalls, callId, nothing)
         isnothing(pending) && throw(ZmqError("unknown pending callId $(callId)"))

@@ -380,3 +380,59 @@ end
 
     @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.decode(oversized)
 end
+
+@testset "IPC parseWorkerMessage is total over peer bytes" begin
+    parse = PevenTransport.IPC.parseWorkerMessage
+
+    hello = parse(PevenTransport.IPC.encode(PevenTransport.IPC.workerHello("workerA")))
+    @test hello isa PevenTransport.IPC.WorkerHello
+    @test hello.workerId == "workerA"
+
+    goodbye = parse(PevenTransport.IPC.encode(PevenTransport.IPC.workerGoodbye("workerA")))
+    @test goodbye isa PevenTransport.IPC.WorkerGoodbye
+    @test goodbye.workerId == "workerA"
+
+    assignment = parse(PevenTransport.IPC.encode(PevenTransport.IPC.assign("run1", "workerA")))
+    @test assignment isa PevenTransport.IPC.Assign
+    @test assignment.runKey == "run1"
+    @test assignment.workerId == "workerA"
+
+    release = parse(PevenTransport.IPC.encode(PevenTransport.IPC.release("run1")))
+    @test release isa PevenTransport.IPC.Release
+    @test release.runKey == "run1"
+
+    resultPayload = PevenTransport.IPC.encode(
+        Dict("kind" => "executorResult", "callId" => 7, "outputs" => Dict()),
+    )
+    reply = parse(resultPayload)
+    @test reply isa PevenTransport.IPC.ExecutorReply
+    @test reply.callId == 7
+    @test reply.payload == resultPayload
+
+    # malformed inputs become values, never exceptions
+    @test parse(UInt8[0xc1]) isa PevenTransport.IPC.Malformed
+    @test parse(PevenTransport.IPC.encode(42)).reason == "message must be a map"
+    @test parse(PevenTransport.IPC.encode(Dict("kind" => 42))).reason == "kind must be a string"
+    @test parse(PevenTransport.IPC.encode(Dict("kind" => "nonsense"))).reason ==
+          "unsupported worker message kind \"nonsense\""
+    @test parse(
+        PevenTransport.IPC.encode(
+            Dict("kind" => "executorResult", "outputs" => Dict()),
+        ),
+    ).reason == "callId must be an integer"
+    @test parse(
+        PevenTransport.IPC.encode(
+            Dict("kind" => "executorResult", "callId" => typemax(UInt64), "outputs" => Dict()),
+        ),
+    ).reason == "callId must be a positive integer"
+end
+
+@testset "IPC integer fields reject values that overflow Int" begin
+    @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.requireCallId(typemax(UInt64))
+    @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.requirePositiveInt(
+        Dict("fuse" => typemax(UInt64)),
+        "fuse",
+    )
+    @test PevenTransport.IPC.requireCallId(UInt64(7)) === 7
+    @test PevenTransport.IPC.requirePositiveInt(Dict("fuse" => UInt64(9)), "fuse") === 9
+end
