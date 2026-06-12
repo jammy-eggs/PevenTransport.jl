@@ -1,19 +1,27 @@
+# A faithful worker echoes the request's callId, whatever the router assigned;
+# echoCallIds=false simulates a byzantine worker for mismatch coverage.
 mutable struct FakeGateway
     workerIds::Vector{String}
     messages::Vector{Any}
     replies::Dict{String,Any}
+    echoCallIds::Bool
+    lock::ReentrantLock
 end
 
-FakeGateway(replies::AbstractVector) = FakeGateway(
+FakeGateway(replies::AbstractVector; echoCallIds::Bool=true) = FakeGateway(
     String[],
     Any[],
     Dict(replyRunKey(reply) => reply for reply in replies),
+    echoCallIds,
+    ReentrantLock(),
 )
 
-FakeGateway(replies::AbstractDict) = FakeGateway(
+FakeGateway(replies::AbstractDict; echoCallIds::Bool=true) = FakeGateway(
     String[],
     Any[],
     Dict(String(runKey) => reply for (runKey, reply) in pairs(replies)),
+    echoCallIds,
+    ReentrantLock(),
 )
 
 function PevenTransport.Router.callWorker(
@@ -22,12 +30,16 @@ function PevenTransport.Router.callWorker(
     payload::Vector{UInt8},
 )
     message = PevenTransport.IPC.decode(payload)
-    push!(gateway.workerIds, workerId)
-    push!(gateway.messages, message)
-    runKey = message["ctx"]["bundle"]["runKey"]
-    haskey(gateway.replies, runKey) ||
-        error("missing fake reply for runKey $(repr(runKey))")
-    return PevenTransport.IPC.encode(pop!(gateway.replies, runKey))
+    reply = lock(gateway.lock) do
+        push!(gateway.workerIds, workerId)
+        push!(gateway.messages, message)
+        runKey = message["ctx"]["bundle"]["runKey"]
+        haskey(gateway.replies, runKey) ||
+            error("missing fake reply for runKey $(repr(runKey))")
+        pop!(gateway.replies, runKey)
+    end
+    gateway.echoCallIds && (reply["callId"] = message["callId"])
+    return PevenTransport.IPC.encode(reply)
 end
 
 function replyRunKey(reply)
@@ -134,9 +146,10 @@ end
     router = PevenTransport.Router.RouterState()
     PevenTransport.Router.registerWorker!(router, "workerA")
     PevenTransport.Router.route!(router, "tau1-002", "workerA")
-    gateway = FakeGateway(Dict(
-        "tau1-002" => PevenTransport.IPC.executorResult(99, Dict()),
-    ))
+    gateway = FakeGateway(
+        Dict("tau1-002" => PevenTransport.IPC.executorResult(99, Dict()));
+        echoCallIds=false,
+    )
     executor = PevenTransport.Router.PythonExecutor(:tool, router, gateway)
 
     @test_throws PevenTransport.Router.RouterError Peven.execute(
