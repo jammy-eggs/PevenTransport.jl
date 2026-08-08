@@ -34,6 +34,58 @@ end
     end
 end
 
+@testset "ZMQ contains unroutable sends" begin
+    endpoint = "inproc://peventransport-unroutable-$(time_ns())"
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+    router = PevenTransport.Router.RouterState()
+    control = ZMQ.Socket(ZMQ.DEALER)
+    control.routing_id = "control"
+    control.rcvtimeo = 20
+    identity = Vector{UInt8}("control")
+    Sockets.connect(control, endpoint)
+
+    try
+        @test_throws ZMQ.StateError PevenTransport.Zmq.sendWorker!(
+            gateway,
+            UInt8[0x01],
+            UInt8[0x02],
+        )
+        Sockets.send(control, UInt8[0x01])
+        ZMQ.recv_multipart(gateway.socket, Vector{UInt8})
+        put!(
+            gateway.outboundSends,
+            PevenTransport.Zmq.OutboundSend(UInt8[0x01], UInt8[0x0a]),
+        )
+        put!(
+            gateway.outboundSends,
+            PevenTransport.Zmq.OutboundSend(identity, UInt8[0x0b]),
+        )
+
+        @test PevenTransport.Zmq.sendOutbound!(gateway) === nothing
+        @test Sockets.recv(control, Vector{UInt8}) == UInt8[0x0b]
+
+        Sockets.send(
+            control,
+            PevenTransport.IPC.encode(PevenTransport.IPC.workerHello("workerA")),
+        )
+        close(control)
+        @test timedwait(
+            () -> try
+                PevenTransport.Zmq.sendWorker!(gateway, identity, UInt8[0x01])
+                false
+            catch error
+                error isa ZMQ.StateError
+            end,
+            1.0;
+            pollint=0.001,
+        ) === :ok
+        @test PevenTransport.Zmq.dispatch!(gateway, router) === nothing
+    finally
+        close(control)
+        close(gateway.socket)
+    end
+end
+
 @testset "ZMQ rejects duplicate worker identities" begin
     endpoint = "inproc://peventransport-duplicate-worker-$(time_ns())"
     router = PevenTransport.Router.RouterState()
@@ -509,34 +561,6 @@ end
     end
 end
 
-@testset "ZMQ forget worker drains only that worker outbound sends" begin
-    endpoint = "inproc://peventransport-forget-worker-outbound-$(time_ns())"
-    router = PevenTransport.Router.RouterState()
-    gateway = PevenTransport.Zmq.gateway(endpoint)
-
-    try
-        identityA = UInt8[0x01]
-        identityB = UInt8[0x02]
-        PevenTransport.Zmq.recordIdentity!(gateway, "workerA", identityA)
-        PevenTransport.Zmq.recordIdentity!(gateway, "workerB", identityB)
-        PevenTransport.Router.registerWorker!(router, "workerA")
-        PevenTransport.Router.registerWorker!(router, "workerB")
-
-        put!(gateway.outboundSends, PevenTransport.Zmq.OutboundSend(identityA, UInt8[0x0a]))
-        put!(gateway.outboundSends, PevenTransport.Zmq.OutboundSend(identityB, UInt8[0x0b]))
-
-        PevenTransport.Zmq.forgetWorker!(gateway, router, "workerA")
-
-        @test isready(gateway.outboundSends)
-        outbound = take!(gateway.outboundSends)
-        @test outbound.identity == identityB
-        @test outbound.payload == UInt8[0x0b]
-        @test !isready(gateway.outboundSends)
-    finally
-        close(gateway.socket)
-    end
-end
-
 @testset "ZMQ gateway stop drains outbound sends" begin
     endpoint = "inproc://peventransport-drain-outbound-$(time_ns())"
     gateway = PevenTransport.Zmq.gateway(endpoint)
@@ -645,6 +669,38 @@ end
         @test fetch(task) == encodeExecutorResult(2)
     finally
         PevenTransport.Zmq.markClosed!(gateway)
+        close(gateway.socket)
+    end
+end
+
+@testset "ZMQ skips canceled queued executor calls" begin
+    endpoint = "inproc://peventransport-canceled-queued-call-$(time_ns())"
+    router = PevenTransport.Router.RouterState()
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+    worker = dealer(endpoint)
+
+    try
+        connectWorker(gateway, router, worker, "workerA")
+        PevenTransport.Zmq.startGateway!(gateway)
+        payload = PevenTransport.IPC.encode(
+            PevenTransport.IPC.executorCall(7, :tool, tauToolCtx("runA")),
+        )
+        task = Threads.@spawn PevenTransport.Router.callWorker(
+            gateway,
+            "workerA",
+            payload,
+        )
+        @test timedwait(() -> isready(gateway.outboundSends), 1.0) === :ok
+
+        PevenTransport.Zmq.timeoutCall!(gateway, 7)
+        @test_throws TaskFailedException fetch(task)
+        PevenTransport.Zmq.sendOutbound!(gateway)
+
+        worker.rcvtimeo = 20
+        @test_throws ZMQ.TimeoutError recvMessage(worker)
+    finally
+        PevenTransport.Zmq.markClosed!(gateway)
+        close(worker)
         close(gateway.socket)
     end
 end

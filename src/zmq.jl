@@ -22,7 +22,11 @@ end
 struct OutboundSend
     identity::Vector{UInt8}
     payload::Vector{UInt8}
+    callId::Union{Nothing,Int}
 end
+
+OutboundSend(identity::Vector{UInt8}, payload::Vector{UInt8}) =
+    OutboundSend(identity, payload, nothing)
 
 const defaultExecutorTimeout = 900.0
 
@@ -67,6 +71,7 @@ Gateway(socket::ZMQ.Socket, executorTimeout::Float64) =
 const zmqHeartbeatIvl = 75
 const zmqHeartbeatTtl = 76
 const zmqHeartbeatTimeout = 77
+const zmqRouterMandatory = 33
 const zmqRouterNotify = 97
 const zmqNotifyDisconnect = 2
 
@@ -95,6 +100,7 @@ function gateway(endpoint::String; executorTimeout::Real=defaultExecutorTimeout)
         throw(ArgumentError("executorTimeout must be a positive number"))
     socket = ZMQ.Socket(ZMQ.ROUTER)
     socket.rcvtimeo = 1
+    setSocketOption!(socket, zmqRouterMandatory, 1)
     setLivenessOptions!(socket)
     Sockets.bind(socket, endpoint)
     return Gateway(socket, timeout)
@@ -155,6 +161,7 @@ function dispatch!(gateway::Gateway, routerState::Router.RouterState)
     try
         handle!(gateway, routerState, identity, message)
     catch error
+        isUnroutable(error) && return nothing
         # parseWorkerMessage already absorbed everything bytes can cause, so
         # this whitelist is exact: protocol-state rejections reply, internal
         # bugs crash loudly.
@@ -392,9 +399,8 @@ function Router.callWorker(gateway::Gateway, workerId::String, payload::Vector{U
     identity = workerIdentity(gateway, workerId)
     channel = registerCall!(gateway, callId, identity)
     try
-        put!(gateway.outboundSends, OutboundSend(identity, payload))
+        put!(gateway.outboundSends, OutboundSend(identity, payload, callId))
         if !hasIdentity(gateway, workerId, identity)
-            drainOutbound!(gateway, identity)
             cancelCall!(gateway, callId)
             throw(ZmqError("worker $(repr(workerId)) disconnected before call was sent"))
         end
@@ -462,16 +468,26 @@ function sendWorker!(gateway::Gateway, identity::Vector{UInt8}, payload::Vector{
     return nothing
 end
 
+function isUnroutable(error)
+    error isa ZMQ.StateError || return false
+    message = unsafe_string(ZMQ.lib.zmq_strerror(Base.Libc.EHOSTUNREACH))
+    return error.msg == message
+end
+
 function sendOutbound!(gateway::Gateway)
     while isready(gateway.outboundSends)
         outbound = take!(gateway.outboundSends)
+        if !isnothing(outbound.callId) &&
+            !isPendingCall(gateway, outbound.callId, outbound.identity)
+            continue
+        end
         try
             withSocketLock(gateway) do
                 sendWorker!(gateway, outbound.identity, outbound.payload)
             end
         catch error
             failPendingCalls!(gateway, outbound.identity, "send to worker failed")
-            rethrow(error)
+            isUnroutable(error) || rethrow(error)
         end
     end
     return nothing
@@ -480,18 +496,6 @@ end
 function drainOutbound!(gateway::Gateway)
     while isready(gateway.outboundSends)
         take!(gateway.outboundSends)
-    end
-    return nothing
-end
-
-function drainOutbound!(gateway::Gateway, identity::Vector{UInt8})
-    kept = OutboundSend[]
-    while isready(gateway.outboundSends)
-        outbound = take!(gateway.outboundSends)
-        outbound.identity == identity || push!(kept, outbound)
-    end
-    for outbound in kept
-        put!(gateway.outboundSends, outbound)
     end
     return nothing
 end
@@ -544,7 +548,6 @@ function forgetWorker!(gateway::Gateway, routerState::Router.RouterState, worker
     identity = forgetIdentity!(gateway, workerId)
     Router.unregisterWorker!(routerState, workerId)
     if !isnothing(identity)
-        drainOutbound!(gateway, identity)
         failPendingCalls!(gateway, identity, "worker $(repr(workerId)) disconnected")
     end
     return nothing
@@ -569,6 +572,13 @@ function registerCall!(gateway::Gateway, callId::Int, identity::Vector{UInt8})
         return channel
     finally
         unlock(gateway.callLock)
+    end
+end
+
+function isPendingCall(gateway::Gateway, callId::Int, identity::Vector{UInt8})
+    lock(gateway.callLock) do
+        pending = get(gateway.pendingCalls, callId, nothing)
+        !isnothing(pending) && pending.identity == identity
     end
 end
 
