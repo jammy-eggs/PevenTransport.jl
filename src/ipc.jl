@@ -4,7 +4,7 @@ using MsgPack
 using Peven
 
 const maxPayloadBytes = 8 * 1024 * 1024
-const protocolVersion = 1
+const protocolVersion = 2
 
 struct IpcError <: Exception
     message::String
@@ -342,8 +342,11 @@ function decodeNet(message)
     for row in requireListField(map, "transitions")
         transition = requireMap(row, "transition")
         id = Symbol(requireString(transition, "id"))
-        transitions[id] =
-            Peven.Transition(id, Symbol(requireString(transition, "executor")))
+        transitions[id] = Peven.Transition(
+            id,
+            Symbol(requireString(transition, "executor"));
+            retries=decodeRetries(transition),
+        )
     end
     arcsFrom = Peven.ArcFrom[]
     for row in requireListField(map, "arcsFrom")
@@ -370,6 +373,13 @@ end
 function decodeCapacity(place)
     isnothing(get(place, "capacity", nothing)) && return nothing
     return requirePositiveInt(place, "capacity")
+end
+
+function decodeRetries(transition)
+    retries = get(transition, "retries", 0)
+    retries isa Integer && !(retries isa Bool) && 0 <= retries <= typemax(Int) ||
+        throw(IpcError("retries must be a non-negative integer"))
+    return Int(retries)
 end
 
 function decodeMarking(message)

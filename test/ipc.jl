@@ -105,7 +105,7 @@ end
     @test hello == Dict(
         "kind" => "workerHello",
         "workerId" => "workerA",
-        "protocol" => 1,
+        "protocol" => 2,
     )
     @test PevenTransport.IPC.decodeWorkerHello(hello) == "workerA"
 
@@ -150,7 +150,7 @@ end
     @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.decodeWorkerHello(Dict(
         "kind" => "workerHello",
         "workerId" => "workerA",
-        "protocol" => 2,
+        "protocol" => 1,
     ))
     @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.decodeWorkerGoodbye(Dict(
         "kind" => "workerGoodbye",
@@ -282,7 +282,7 @@ end
             Dict("id" => "prompt", "capacity" => nothing),
             Dict("id" => "done", "capacity" => 2),
         ],
-        "transitions" => [Dict("id" => "solve", "executor" => "solve")],
+        "transitions" => [Dict("id" => "solve", "executor" => "solve", "retries" => 2)],
         "arcsFrom" => [Dict(
             "transition" => "solve", "from" => "prompt",
             "weight" => 1, "optional" => false,
@@ -294,7 +294,7 @@ end
     @test net.places[:done].capacity == 2
     @test net.transitions[:solve].executor == :solve
     @test isnothing(net.transitions[:solve].guard)
-    @test net.transitions[:solve].retries == 0
+    @test net.transitions[:solve].retries == 2
     @test only(net.arcsfrom) == PevenTransport.Peven.ArcFrom(:solve, :prompt, 1)
     @test only(net.arcsto) == PevenTransport.Peven.ArcTo(:solve, :done, 1)
 
@@ -305,6 +305,16 @@ end
     boolCapacity = deepcopy(lowered)
     boolCapacity["places"][2]["capacity"] = true
     @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.decodeNet(boolCapacity)
+
+    legacy = deepcopy(lowered)
+    delete!(legacy["transitions"][1], "retries")
+    @test PevenTransport.IPC.decodeNet(legacy).transitions[:solve].retries == 0
+
+    for retries in (true, -1, big(typemax(Int)) + 1)
+        invalid = deepcopy(lowered)
+        invalid["transitions"][1]["retries"] = retries
+        @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.decodeNet(invalid)
+    end
 end
 
 @testset "IPC decodes lowered markings" begin
