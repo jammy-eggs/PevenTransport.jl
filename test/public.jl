@@ -1,4 +1,4 @@
-@testset "PevenTransport loads Peven v0.5 API" begin
+@testset "PevenTransport loads Peven v0.6 API" begin
     @test isdefined(PevenTransport, :Peven)
     @test isdefined(PevenTransport.Peven, :Net)
     @test isdefined(PevenTransport.Peven, :Marking)

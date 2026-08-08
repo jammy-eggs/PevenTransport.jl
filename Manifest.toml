@@ -1,6 +1,6 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.5"
+julia_version = "1.12.6"
 manifest_format = "2.0"
 project_hash = "1ed72307395c3bb741d83078b3eea208072374e3"
 
@@ -34,7 +34,7 @@ uuid = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 version = "1.2.1"
 
 [[deps.Peven]]
-path = "../Peven.jl"
+git-tree-sha1 = "47cdae842de8b2effc93eb590bb63138dc02640e"
 uuid = "7c3f1014-b4da-4ae0-8bf8-3335ad02c49c"
 version = "0.6.0"
 
@@ -42,7 +42,7 @@ version = "0.6.0"
 deps = ["MsgPack", "Peven", "Sockets", "ZMQ"]
 path = "."
 uuid = "d91f4ba2-6d31-4fa2-8445-a14fdb8658c7"
-version = "0.1.0"
+version = "0.2.0"
 
 [[deps.PrecompileTools]]
 deps = ["Preferences"]

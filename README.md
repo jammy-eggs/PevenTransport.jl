@@ -11,7 +11,7 @@ workers and `Peven.jl`.
 - `Router`: `runKey` to worker routing plus `Peven.execute` integration.
 - `Zmq`: a ZMQ `ROUTER` gateway for Python `DEALER` workers.
 
-The package imports and exposes the pinned `Peven.jl` dependency as
+The package imports and exposes its compatible `Peven.jl` dependency as
 `PevenTransport.Peven` for callers that need the exact engine API.
 
 ## Architecture Pattern
@@ -35,11 +35,19 @@ a ZMQ `ROUTER` socket and routes executor calls by worker identity.
 
 Current message flow:
 
+- `loadNet` -> `netLoaded`
+- `fire` -> `runFinished` messages, then `fireFinished`
 - `workerHello` -> `workerReady`
 - `assign` -> `assigned`
 - `executorCall` -> `executorResult` or `executorError`
 - `release` -> `released`
 - `workerGoodbye` -> `workerGone`
+
+Malformed non-empty messages and non-fire protocol rejections receive a
+best-effort `gatewayError`; once a fire request decodes, rejection or completion
+closes with a correlated `fireFinished`. Protocol version `2` is required during
+the worker handshake. ZMQ heartbeats plus libzmq's draft `ROUTER_NOTIFY`
+disconnect notifications retire worker identities; workers are not restarted.
 
 Executor calls carry:
 
@@ -52,7 +60,7 @@ input token buckets. Tokens preserve `color`, `runKey`, and `payload`.
 
 ## Version
 
-This repo targets `Peven.jl` `0.5.x` and is currently versioned as `0.1.0`.
+This repo targets `Peven.jl` `0.6.x` and is versioned as `0.2.0`.
 
 ## Tests
 
