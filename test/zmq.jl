@@ -410,7 +410,7 @@ end
 
         @test take!(channel) == payload
         @test isempty(gateway.pendingCalls)
-        @test_throws PevenTransport.Zmq.ZmqError PevenTransport.Zmq.completeCall!(
+        PevenTransport.Zmq.completeCall!(
             gateway,
             identity,
             7,
@@ -712,6 +712,27 @@ end
 
         @test take!(channel) == payload
         @test isempty(gateway.pendingCalls)
+    finally
+        close(worker)
+        close(gateway.socket)
+    end
+end
+
+@testset "ZMQ ignores replies for canceled calls" begin
+    endpoint = "inproc://peventransport-stale-reply-$(time_ns())"
+    router = PevenTransport.Router.RouterState()
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+    worker = dealer(endpoint)
+
+    try
+        connectWorker(gateway, router, worker, "workerA")
+        identity = gateway.identities["workerA"]
+        PevenTransport.Zmq.registerCall!(gateway, 12, identity)
+        PevenTransport.Zmq.cancelCall!(gateway, 12)
+        Sockets.send(worker, encodeExecutorResult(12))
+        PevenTransport.Zmq.dispatch!(gateway, router)
+
+        connectWorker(gateway, router, worker, "workerA")
     finally
         close(worker)
         close(gateway.socket)

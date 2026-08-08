@@ -590,11 +590,12 @@ function completeCall!(
 )
     pending = lock(gateway.callLock) do
         pending = get(gateway.pendingCalls, callId, nothing)
-        isnothing(pending) && throw(ZmqError("unknown pending callId $(callId)"))
+        isnothing(pending) && return nothing
         pending.identity == identity ||
             throw(ZmqError("worker reply came from unexpected identity"))
         pop!(gateway.pendingCalls, callId)
     end
+    isnothing(pending) && return nothing
     put!(pending.reply, payload)
     return nothing
 end
