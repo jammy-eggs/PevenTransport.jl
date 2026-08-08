@@ -336,12 +336,14 @@ function decodeNet(message)
     for row in requireListField(map, "places")
         place = requireMap(row, "place")
         id = Symbol(requireString(place, "id"))
+        haskey(places, id) && throw(IpcError("duplicate place id :$id"))
         places[id] = Peven.Place(id, decodeCapacity(place))
     end
     transitions = Dict{Symbol,Peven.Transition}()
     for row in requireListField(map, "transitions")
         transition = requireMap(row, "transition")
         id = Symbol(requireString(transition, "id"))
+        haskey(transitions, id) && throw(IpcError("duplicate transition id :$id"))
         transitions[id] = Peven.Transition(
             id,
             Symbol(requireString(transition, "executor"));

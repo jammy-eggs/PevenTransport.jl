@@ -306,6 +306,31 @@ end
     boolCapacity["places"][2]["capacity"] = true
     @test_throws PevenTransport.IPC.IpcError PevenTransport.IPC.decodeNet(boolCapacity)
 
+    duplicatePlace = deepcopy(lowered)
+    push!(duplicatePlace["places"], deepcopy(duplicatePlace["places"][1]))
+    placeError = try
+        PevenTransport.IPC.decodeNet(duplicatePlace)
+        nothing
+    catch error
+        error
+    end
+    @test placeError isa PevenTransport.IPC.IpcError
+    @test placeError.message == "duplicate place id :prompt"
+
+    duplicateTransition = deepcopy(lowered)
+    push!(
+        duplicateTransition["transitions"],
+        deepcopy(duplicateTransition["transitions"][1]),
+    )
+    transitionError = try
+        PevenTransport.IPC.decodeNet(duplicateTransition)
+        nothing
+    catch error
+        error
+    end
+    @test transitionError isa PevenTransport.IPC.IpcError
+    @test transitionError.message == "duplicate transition id :solve"
+
     legacy = deepcopy(lowered)
     delete!(legacy["transitions"][1], "retries")
     @test PevenTransport.IPC.decodeNet(legacy).transitions[:solve].retries == 0
