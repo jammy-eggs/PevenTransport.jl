@@ -268,8 +268,6 @@ function handle!(
     identity::Vector{UInt8},
     message::IPC.LoadNet,
 )
-    # registerNet! writes the engine's unlocked executor registry, which
-    # active fires read concurrently — reject instead of racing.
     lock(gateway.controlLock) do
         isempty(gateway.activeFires) ||
             throw(ZmqError("cannot load a net while fires are active"))
@@ -277,7 +275,7 @@ function handle!(
     issues = Peven.validate!(Peven.ValidationIssue[], message.net)
     isempty(issues) ||
         throw(ZmqError("invalid net $(repr(message.name)): $(issues[1].message)"))
-    registerNet!(gateway, routerState, message.name, message.net)
+    registerNet!(gateway, message.name, message.net)
     reply = IPC.netLoaded(message.name) |> IPC.encode
     withSocketLock(gateway) do
         sendWorker!(gateway, identity, reply)
@@ -295,20 +293,9 @@ function handle!(
     return nothing
 end
 
-function registerNet!(
-    gateway::Gateway,
-    routerState::Router.RouterState,
-    name::String,
-    net::Peven.Net,
-)
+function registerNet!(gateway::Gateway, name::String, net::Peven.Net)
     lock(gateway.controlLock) do
         gateway.nets[name] = net
-    end
-    for transition in values(net.transitions)
-        Peven.registerExec!(
-            transition.executor,
-            Router.PythonExecutor(transition.executor, routerState, gateway),
-        )
     end
     return nothing
 end
@@ -329,7 +316,7 @@ function fire!(
     net = lock(gateway.controlLock) do
         gateway.nets[request.net]
     end
-    Threads.@spawn streamFire!(gateway, identity, request, net)
+    Threads.@spawn streamFire!(gateway, routerState, identity, request, net)
     return nothing
 end
 
@@ -353,6 +340,7 @@ end
 
 function streamFire!(
     gateway::Gateway,
+    routerState::Router.RouterState,
     identity::Vector{UInt8},
     request,
     net::Peven.Net,
@@ -364,6 +352,7 @@ function streamFire!(
             fuse = request.fuse,
             maxConcurrency = request.maxConcurrency,
             onEvent = event -> streamRunFinished!(gateway, identity, request.fireId, event),
+            resolveExec = name -> Router.PythonExecutor(name, routerState, gateway),
         )
         nothing
     catch caught

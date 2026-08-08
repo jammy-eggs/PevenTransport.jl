@@ -965,10 +965,13 @@ function controlMarking(runKey::String)
 end
 
 @testset "ZMQ control client loads nets" begin
+    Peven = PevenTransport.Peven
     endpoint = "inproc://peventransport-load-net-$(time_ns())"
     router = PevenTransport.Router.RouterState()
     gateway = PevenTransport.Zmq.gateway(endpoint)
     control = dealer(endpoint)
+    sentinel = Peven.FunctionExecutor(_ -> nothing)
+    Peven.registerExec!(:solve, sentinel)
 
     try
         reply = dispatchReply(
@@ -977,8 +980,7 @@ end
         )
         @test reply == PevenTransport.IPC.netLoaded("ctrl")
         @test haskey(gateway.nets, "ctrl")
-        @test PevenTransport.Peven.getExec(:solve) isa
-              PevenTransport.Router.PythonExecutor
+        @test Peven.getExec(:solve) === sentinel
 
         dangling = loweredControlNet("broken")
         dangling["arcsFrom"][1]["from"] = "ghost"
@@ -990,6 +992,7 @@ end
         @test startswith(rejected["error"], "invalid net \"broken\"")
         @test !haskey(gateway.nets, "broken")
     finally
+        Peven.unregisterExec!(:solve)
         close(control)
         close(gateway.socket)
     end
