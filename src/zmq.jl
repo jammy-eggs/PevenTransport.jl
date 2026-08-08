@@ -310,7 +310,7 @@ function fire!(
 )
     error = claimFire!(gateway, routerState, request)
     if !isnothing(error)
-        sendControl!(gateway, identity, IPC.fireFinished(request.fireId, error))
+        sendFireFinished!(gateway, identity, request.fireId, error)
         return nothing
     end
     net = lock(gateway.controlLock) do
@@ -362,7 +362,7 @@ function streamFire!(
             delete!(gateway.activeFires, request.fireId)
         end
     end
-    sendControl!(gateway, identity, IPC.fireFinished(request.fireId, error))
+    sendFireFinished!(gateway, identity, request.fireId, error)
     return nothing
 end
 
@@ -379,6 +379,27 @@ end
 
 function sendControl!(gateway::Gateway, identity::Vector{UInt8}, message)
     put!(gateway.outboundSends, OutboundSend(identity, IPC.encode(message)))
+    return nothing
+end
+
+function sendFireFinished!(
+    gateway::Gateway,
+    identity::Vector{UInt8},
+    fireId::String,
+    error::Union{Nothing,String},
+)
+    try
+        sendControl!(gateway, identity, IPC.fireFinished(fireId, error))
+    catch caught
+        oversized = caught isa IPC.IpcError &&
+                    caught.message == "IPC payload exceeds $(IPC.maxPayloadBytes) bytes"
+        oversized || rethrow()
+        sendControl!(
+            gateway,
+            identity,
+            IPC.fireFinished(fireId, "fire error exceeds IPC payload limit"),
+        )
+    end
     return nothing
 end
 

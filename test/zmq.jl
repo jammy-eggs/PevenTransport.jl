@@ -1031,6 +1031,31 @@ end
     end
 end
 
+@testset "ZMQ bounds terminal fire errors" begin
+    endpoint = "inproc://peventransport-terminal-error-$(time_ns())"
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+    identity = UInt8[0x01]
+
+    try
+        PevenTransport.Zmq.sendFireFinished!(
+            gateway,
+            identity,
+            "groupA",
+            repeat("x", PevenTransport.IPC.maxPayloadBytes),
+        )
+        outbound = take!(gateway.outboundSends)
+        @test outbound.identity == identity
+        @test PevenTransport.IPC.decode(outbound.payload) ==
+              PevenTransport.IPC.fireFinished(
+            "groupA",
+            "fire error exceeds IPC payload limit",
+        )
+        @test !isready(gateway.outboundSends)
+    finally
+        close(gateway.socket)
+    end
+end
+
 @testset "ZMQ fire streams run results to the control client" begin
     endpoint = "inproc://peventransport-fire-stream-$(time_ns())"
     router = PevenTransport.Router.RouterState()
