@@ -83,7 +83,7 @@ end
 
 function gateway(endpoint::String)
     socket = ZMQ.Socket(ZMQ.ROUTER)
-    socket.rcvtimeo = 50
+    socket.rcvtimeo = 1
     setLivenessOptions!(socket)
     Sockets.bind(socket, endpoint)
     return Gateway(socket)

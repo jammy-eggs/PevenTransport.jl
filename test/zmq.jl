@@ -722,6 +722,7 @@ end
     endpoint = "inproc://peventransport-run-$(time_ns())"
     router = PevenTransport.Router.RouterState()
     gateway = PevenTransport.Zmq.gateway(endpoint)
+    @test gateway.socket.rcvtimeo == 1
     worker = dealer(endpoint)
     runTask = Threads.@spawn PevenTransport.Zmq.run!(gateway, router)
 
