@@ -17,6 +17,23 @@ import Sockets
     end
 end
 
+@testset "ZMQ validates executor timeout" begin
+    endpoint = "inproc://peventransport-executor-timeout-$(time_ns())"
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+    try
+        @test gateway.executorTimeout == 900.0
+    finally
+        close(gateway.socket)
+    end
+
+    for timeout in (0, NaN, Inf)
+        @test_throws ArgumentError PevenTransport.Zmq.gateway(
+            "inproc://peventransport-invalid-timeout-$(time_ns())";
+            executorTimeout=timeout,
+        )
+    end
+end
+
 @testset "ZMQ rejects duplicate worker identities" begin
     endpoint = "inproc://peventransport-duplicate-worker-$(time_ns())"
     router = PevenTransport.Router.RouterState()
@@ -586,6 +603,48 @@ end
             PevenTransport.IPC.encode(PevenTransport.IPC.executorCall(1, :tool, tauToolCtx("runA"))),
         )
     finally
+        close(gateway.socket)
+    end
+end
+
+@testset "ZMQ replies wake pending calls immediately" begin
+    endpoint = "inproc://peventransport-call-wakeup-$(time_ns())"
+    gateway = PevenTransport.Zmq.gateway(endpoint)
+
+    try
+        identity = UInt8[0x01]
+        PevenTransport.Zmq.recordIdentity!(gateway, "workerA", identity)
+        PevenTransport.Zmq.startGateway!(gateway)
+        warmPayload = PevenTransport.IPC.encode(
+            PevenTransport.IPC.executorCall(1, :tool, tauToolCtx("runA")),
+        )
+        warmTask = Threads.@spawn PevenTransport.Router.callWorker(
+            gateway,
+            "workerA",
+            warmPayload,
+        )
+        take!(gateway.outboundSends)
+        PevenTransport.Zmq.completeCall!(gateway, identity, 1, encodeExecutorResult(1))
+        fetch(warmTask)
+
+        payload = PevenTransport.IPC.encode(
+            PevenTransport.IPC.executorCall(2, :tool, tauToolCtx("runA")),
+        )
+        task = Threads.@spawn PevenTransport.Router.callWorker(
+            gateway,
+            "workerA",
+            payload,
+        )
+        take!(gateway.outboundSends)
+        sleep(0.01)
+
+        PevenTransport.Zmq.completeCall!(gateway, identity, 2, encodeExecutorResult(2))
+        sleep(0.05)
+
+        @test istaskdone(task)
+        @test fetch(task) == encodeExecutorResult(2)
+    finally
+        PevenTransport.Zmq.markClosed!(gateway)
         close(gateway.socket)
     end
 end

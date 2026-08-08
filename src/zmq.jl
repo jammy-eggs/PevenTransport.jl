@@ -24,11 +24,14 @@ struct OutboundSend
     payload::Vector{UInt8}
 end
 
+const defaultExecutorTimeout = 900.0
+
 mutable struct Gateway
     socket::ZMQ.Socket
     identities::Dict{String,Vector{UInt8}}
     pendingCalls::Dict{Int,PendingCall}
     outboundSends::Channel{OutboundSend}
+    executorTimeout::Float64
     nets::Dict{String,Peven.Net}
     activeFires::Set{String}
     lifecycle::Symbol
@@ -39,12 +42,15 @@ mutable struct Gateway
     controlLock::ReentrantLock
 end
 
-Gateway(socket::ZMQ.Socket) =
+Gateway(socket::ZMQ.Socket) = Gateway(socket, defaultExecutorTimeout)
+
+Gateway(socket::ZMQ.Socket, executorTimeout::Float64) =
     Gateway(
         socket,
         Dict{String,Vector{UInt8}}(),
         Dict{Int,PendingCall}(),
         Channel{OutboundSend}(1024),
+        executorTimeout,
         Dict{String,Peven.Net}(),
         Set{String}(),
         :open,
@@ -81,12 +87,17 @@ function setSocketOption!(socket::ZMQ.Socket, option::Integer, value::Integer)
     return nothing
 end
 
-function gateway(endpoint::String)
+function gateway(endpoint::String; executorTimeout::Real=defaultExecutorTimeout)
+    executorTimeout isa Bool &&
+        throw(ArgumentError("executorTimeout must be a positive number"))
+    timeout = Float64(executorTimeout)
+    isfinite(timeout) && timeout > 0 ||
+        throw(ArgumentError("executorTimeout must be a positive number"))
     socket = ZMQ.Socket(ZMQ.ROUTER)
     socket.rcvtimeo = 1
     setLivenessOptions!(socket)
     Sockets.bind(socket, endpoint)
-    return Gateway(socket)
+    return Gateway(socket, timeout)
 end
 
 function run!(gateway::Gateway, routerState::Router.RouterState)
@@ -391,7 +402,14 @@ function Router.callWorker(gateway::Gateway, workerId::String, payload::Vector{U
             cancelCall!(gateway, callId)
             throw(ZmqError("gateway stopped before call was sent"))
         end
-        reply = take!(channel)
+        timer = Timer(gateway.executorTimeout) do _
+            timeoutCall!(gateway, callId)
+        end
+        reply = try
+            take!(channel)
+        finally
+            close(timer)
+        end
         reply isa Exception && throw(reply)
         return reply
     catch error
@@ -600,6 +618,15 @@ function completeCall!(
     return nothing
 end
 
+function timeoutCall!(gateway::Gateway, callId::Int)
+    pending = lock(gateway.callLock) do
+        pop!(gateway.pendingCalls, callId, nothing)
+    end
+    isnothing(pending) && return nothing
+    put!(pending.reply, ZmqError("executor call timed out"))
+    return nothing
+end
+
 function cancelCall!(gateway::Gateway, callId::Int)
     lock(gateway.callLock)
     try
@@ -612,8 +639,8 @@ end
 
 # Blocking entry point for the group runner: the process is the gateway.
 # The runner owns the process lifecycle; there is no stop message.
-function serve(endpoint::String)
-    run!(gateway(endpoint), Router.RouterState())
+function serve(endpoint::String; executorTimeout::Real=defaultExecutorTimeout)
+    run!(gateway(endpoint; executorTimeout), Router.RouterState())
     return nothing
 end
 

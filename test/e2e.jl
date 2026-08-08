@@ -167,6 +167,40 @@ end
     end
 end
 
+@testset "Peven.fire times out a ZMQ executor call" begin
+    Peven = PevenTransport.Peven
+    endpoint = "inproc://peventransport-fire-zmq-timeout-$(time_ns())"
+    router = PevenTransport.Router.RouterState()
+    gateway = PevenTransport.Zmq.gateway(endpoint; executorTimeout=0.05)
+    worker = dealer(endpoint)
+    runTask = Threads.@spawn PevenTransport.Zmq.run!(gateway, router)
+
+    try
+        sendWorkerHello(worker, "workerA")
+        @test recvMessage(worker) == PevenTransport.IPC.workerReady("workerA")
+
+        PevenTransport.Router.route!(router, "tau1-002", "workerA")
+        executor = PevenTransport.Router.PythonExecutor(:finishExecutor, router, gateway)
+        fireTask = Threads.@spawn withExec(:finishExecutor, executor) do
+            Peven.fire(simpleNet(), simpleMarking())
+        end
+
+        call = recvMessage(worker)
+        @test call["kind"] == "executorCall"
+        @test timedwait(() -> istaskdone(fireTask), 2.0) === :ok
+
+        result = only(fetch(fireTask))
+        @test result.status === :failed
+        @test result.reason === :executorFailed
+        @test result.error == "executor call timed out"
+        @test isempty(gateway.pendingCalls)
+    finally
+        close(worker)
+        PevenTransport.Zmq.stop!(gateway)
+        fetch(runTask)
+    end
+end
+
 @testset "Router runs multiple runKeys through one Peven.fire" begin
     Peven = PevenTransport.Peven
     router = PevenTransport.Router.RouterState()
